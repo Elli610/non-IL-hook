@@ -17,6 +17,7 @@ import {IERC20} from "forge-std/interfaces/IERC20.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
 import {ERC20} from "solmate/src/tokens/ERC20.sol";
+import {SafeTransferLib} from "solmate/src/utils/SafeTransferLib.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 
 uint160 constant HOOK_FLAGS = uint160(
@@ -33,8 +34,15 @@ contract NonToxicPool is BaseHook, NonToxicMath, ERC20, IUnlockCallback {
     using LPFeeLibrary for uint24;
     using PoolIdLibrary for PoolKey;
     using BalanceDeltaLibrary for BalanceDelta;
+    using SafeTransferLib for ERC20;
 
-    uint24 public constant WANTED_DRAWBACK = 9_000; // ~1.5 tick spacing
+    /// @dev Drawback threshold numerator. A rebalance triggers when
+    ///      delta * 1_000_000 > WANTED_DRAWBACK * extremumSqrtPriceScaled,
+    ///      i.e. when price has moved ~0.9% from the extremum.
+    uint24 public constant WANTED_DRAWBACK = 9_000;
+
+    /// @dev Dead shares burned on first deposit to prevent ERC4626-style inflation attacks.
+    uint256 internal constant MINIMUM_LIQUIDITY = 1_000;
 
     IStateView public immutable stateView;
     IERC20 public immutable token0;
@@ -68,6 +76,9 @@ contract NonToxicPool is BaseHook, NonToxicMath, ERC20, IUnlockCallback {
     error ZeroShares();
     error InsufficientShares();
     error OnlyPoolManager();
+    error SlippageTooHigh();
+    error InvalidConstructorParams();
+    error UnknownAction(uint8 action);
 
     event Deposit(address indexed user, uint256 amount0, uint256 amount1, uint256 shares);
     event Withdraw(address indexed user, uint256 shares, uint256 amount0, uint256 amount1);
@@ -82,6 +93,13 @@ contract NonToxicPool is BaseHook, NonToxicMath, ERC20, IUnlockCallback {
         int24 _wideRangeMultiplier,
         int24 _narrowRangeMultiplier
     ) BaseHook(_poolManager) ERC20("NonToxic Vault", "ntVLT", 18) {
+        if (address(_token0) == address(0) || address(_token1) == address(0)) {
+            revert InvalidConstructorParams();
+        }
+        if (address(_stateView) == address(0)) revert InvalidConstructorParams();
+        if (_alpha == 0) revert InvalidConstructorParams();
+        if (_wideRangeMultiplier <= 0 || _narrowRangeMultiplier <= 0) revert InvalidConstructorParams();
+
         alpha = _alpha;
         token0 = _token0;
         token1 = _token1;
@@ -166,7 +184,7 @@ contract NonToxicPool is BaseHook, NonToxicMath, ERC20, IUnlockCallback {
         override
         returns (bytes4, int128)
     {
-        bool isUpTrend = extremumSqrtPriceScaled > initialSqrtPriceScaled;
+        bool isUpTrend = extremumSqrtPriceScaled >= initialSqrtPriceScaled;
         (uint160 sqrtPriceX96, int24 currentTick,,) = stateView.getSlot0(key.toId());
         uint256 currentSqrtPriceScaled = (SCALE * uint256(sqrtPriceX96)) / Q96;
 
@@ -174,12 +192,14 @@ contract NonToxicPool is BaseHook, NonToxicMath, ERC20, IUnlockCallback {
             ? currentSqrtPriceScaled - extremumSqrtPriceScaled
             : extremumSqrtPriceScaled - currentSqrtPriceScaled;
 
-        if (delta / 2e6 > WANTED_DRAWBACK * currentSqrtPriceScaled) {
+        // Drawback check: delta / extremum > WANTED_DRAWBACK / 1_000_000
+        // Rewritten as: delta * 1_000_000 > WANTED_DRAWBACK * extremum (no division truncation)
+        if (delta * 1_000_000 > uint256(WANTED_DRAWBACK) * extremumSqrtPriceScaled) {
             initialSqrtPriceScaled = extremumSqrtPriceScaled;
             extremumSqrtPriceScaled = currentSqrtPriceScaled;
 
             if (widePosition.liquidity > 0 || narrowPosition.liquidity > 0) {
-                _rebalance(key, currentTick, sqrtPriceX96);
+                _rebalance();
             }
 
             return (BaseHook.afterSwap.selector, 0);
@@ -195,22 +215,31 @@ contract NonToxicPool is BaseHook, NonToxicMath, ERC20, IUnlockCallback {
 
     // ===================== VAULT: DEPOSIT & WITHDRAW =====================
 
-    function deposit(uint256 amount0, uint256 amount1) external {
+    /// @notice Deposit tokens into the vault and receive shares.
+    /// @param amount0 Amount of token0 to deposit.
+    /// @param amount1 Amount of token1 to deposit.
+    /// @param minShares Minimum shares to receive (slippage protection). Pass 0 to skip.
+    function deposit(uint256 amount0, uint256 amount1, uint256 minShares) external {
         if (!poolInitialized) revert PoolNotInitialized();
         if (amount0 == 0 && amount1 == 0) revert ZeroDeposit();
 
-        if (amount0 > 0) token0.transferFrom(msg.sender, address(this), amount0);
-        if (amount1 > 0) token1.transferFrom(msg.sender, address(this), amount1);
+        if (amount0 > 0) ERC20(address(token0)).safeTransferFrom(msg.sender, address(this), amount0);
+        if (amount1 > 0) ERC20(address(token1)).safeTransferFrom(msg.sender, address(this), amount1);
 
         bytes memory result = poolManager.unlock(abi.encode(ACTION_DEPOSIT, amount0, amount1));
         uint256 shares = abi.decode(result, (uint256));
         if (shares == 0) revert ZeroShares();
+        if (shares < minShares) revert SlippageTooHigh();
 
         _mint(msg.sender, shares);
         emit Deposit(msg.sender, amount0, amount1, shares);
     }
 
-    function withdraw(uint256 shares) external {
+    /// @notice Withdraw shares from the vault and receive proportional tokens.
+    /// @param shares Number of shares to burn.
+    /// @param minAmount0 Minimum token0 to receive (slippage protection). Pass 0 to skip.
+    /// @param minAmount1 Minimum token1 to receive (slippage protection). Pass 0 to skip.
+    function withdraw(uint256 shares, uint256 minAmount0, uint256 minAmount1) external {
         if (shares == 0 || shares > balanceOf[msg.sender]) revert InsufficientShares();
 
         uint256 supply = totalSupply;
@@ -219,8 +248,10 @@ contract NonToxicPool is BaseHook, NonToxicMath, ERC20, IUnlockCallback {
         bytes memory result = poolManager.unlock(abi.encode(ACTION_WITHDRAW, shares, supply));
         (uint256 out0, uint256 out1) = abi.decode(result, (uint256, uint256));
 
-        if (out0 > 0) token0.transfer(msg.sender, out0);
-        if (out1 > 0) token1.transfer(msg.sender, out1);
+        if (out0 < minAmount0 || out1 < minAmount1) revert SlippageTooHigh();
+
+        if (out0 > 0) ERC20(address(token0)).safeTransfer(msg.sender, out0);
+        if (out1 > 0) ERC20(address(token1)).safeTransfer(msg.sender, out1);
 
         emit Withdraw(msg.sender, shares, out0, out1);
     }
@@ -230,7 +261,7 @@ contract NonToxicPool is BaseHook, NonToxicMath, ERC20, IUnlockCallback {
     function unlockCallback(bytes calldata data) external override returns (bytes memory) {
         if (msg.sender != address(poolManager)) revert OnlyPoolManager();
 
-        (uint8 action) = abi.decode(data[:32], (uint8));
+        uint8 action = abi.decode(data[:32], (uint8));
 
         if (action == ACTION_DEPOSIT) {
             return _handleDeposit(data);
@@ -238,7 +269,7 @@ contract NonToxicPool is BaseHook, NonToxicMath, ERC20, IUnlockCallback {
             return _handleWithdraw(data);
         }
 
-        return "";
+        revert UnknownAction(action);
     }
 
     // ===================== INTERNAL: CALLBACK HANDLERS =====================
@@ -261,6 +292,11 @@ contract NonToxicPool is BaseHook, NonToxicMath, ERC20, IUnlockCallback {
 
         if (supply == 0) {
             shares = depositAmount0 + depositAmount1;
+            // Dead shares: burn MINIMUM_LIQUIDITY to address(1) to prevent inflation attacks
+            if (shares > MINIMUM_LIQUIDITY) {
+                _mint(address(1), MINIMUM_LIQUIDITY);
+                shares -= MINIMUM_LIQUIDITY;
+            }
         } else {
             (uint160 sqrtPriceX96,,,) = stateView.getSlot0(storedPoolKey.toId());
             uint256 preValue = _valueInToken1(preBal0, preBal1, sqrtPriceX96);
@@ -287,9 +323,7 @@ contract NonToxicPool is BaseHook, NonToxicMath, ERC20, IUnlockCallback {
         uint256 out0 = (totalBal0 * shares) / supply;
         uint256 out1 = (totalBal1 * shares) / supply;
 
-        // Set aside withdrawal amounts (they'll be transferred after unlock returns)
-        // Re-provision the remaining tokens
-        // We need to track what to send. Store temporarily and re-provision the rest.
+        // Re-provision remaining tokens
         uint256 remaining0 = totalBal0 - out0;
         uint256 remaining1 = totalBal1 - out1;
 
@@ -430,7 +464,7 @@ contract NonToxicPool is BaseHook, NonToxicMath, ERC20, IUnlockCallback {
         _settleDelta(storedPoolKey.currency1, callerDelta.amount1());
     }
 
-    function _rebalance(PoolKey calldata key, int24 currentTick, uint160 sqrtPriceX96) internal {
+    function _rebalance() internal {
         _removeAllLiquidity();
         _provisionLiquidity();
 
@@ -446,7 +480,7 @@ contract NonToxicPool is BaseHook, NonToxicMath, ERC20, IUnlockCallback {
             // Hook owes tokens to pool (adding liquidity)
             uint256 amount = uint256(-delta);
             poolManager.sync(currency);
-            IERC20(Currency.unwrap(currency)).transfer(address(poolManager), amount);
+            ERC20(Currency.unwrap(currency)).safeTransfer(address(poolManager), amount);
             poolManager.settle();
         } else if (delta > 0) {
             // Pool owes tokens to hook (removing liquidity)
@@ -465,7 +499,6 @@ contract NonToxicPool is BaseHook, NonToxicMath, ERC20, IUnlockCallback {
     function _valueInToken1(uint256 amt0, uint256 amt1, uint160 sqrtPriceX96) internal pure returns (uint256) {
         // price_token1_per_token0 = (sqrtPriceX96 / 2^96)^2
         // value = amt0 * price + amt1
-        // Split multiplication to avoid overflow
         uint256 value0 = (uint256(sqrtPriceX96) * amt0) / Q96;
         value0 = (value0 * uint256(sqrtPriceX96)) / Q96;
         return value0 + amt1;

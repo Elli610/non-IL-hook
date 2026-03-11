@@ -37,24 +37,24 @@ contract NonToxicMathTest is Test {
 
     // --- zeroForOne = true ---
 
-    function test_preComputeVolume1_zeroForOne_positiveAmount() public {
+    function test_preComputeVolume1_zeroForOne_positiveAmount() public view {
         int256 result = math.exposed_preComputeVolume1(true, 1000, 100);
         assertEq(result, -1000);
     }
 
-    function test_preComputeVolume1_zeroForOne_negativeAmount() public {
+    function test_preComputeVolume1_zeroForOne_negativeAmount() public view {
         int256 result = math.exposed_preComputeVolume1(true, -500, 100);
         assertEq(result, -500);
     }
 
-    function test_preComputeVolume1_zeroForOne_zeroAmount() public {
+    function test_preComputeVolume1_zeroForOne_zeroAmount() public view {
         // amountSpecified = 0 does not match either zeroForOne branch (>0 or <0),
         // falls through to: 0 * sqrtPrice^2 = 0
         int256 result = math.exposed_preComputeVolume1(true, 0, 100);
         assertEq(result, 0);
     }
 
-    function test_preComputeVolume1_zeroForOne_positiveAmount_ignoresSqrtPrice() public {
+    function test_preComputeVolume1_zeroForOne_positiveAmount_ignoresSqrtPrice() public view {
         // When zeroForOne && amount > 0, sqrtPrice is irrelevant
         int256 r1 = math.exposed_preComputeVolume1(true, 42, 1);
         int256 r2 = math.exposed_preComputeVolume1(true, 42, 999);
@@ -62,20 +62,20 @@ contract NonToxicMathTest is Test {
         assertEq(r2, -42);
     }
 
-    function test_preComputeVolume1_zeroForOne_negativeAmount_ignoresSqrtPrice() public {
+    function test_preComputeVolume1_zeroForOne_negativeAmount_ignoresSqrtPrice() public view {
         int256 r1 = math.exposed_preComputeVolume1(true, -77, 1);
         int256 r2 = math.exposed_preComputeVolume1(true, -77, 999);
         assertEq(r1, -77);
         assertEq(r2, -77);
     }
 
-    function test_preComputeVolume1_zeroForOne_largePositive() public {
+    function test_preComputeVolume1_zeroForOne_largePositive() public view {
         int256 amt = 1e18;
         int256 result = math.exposed_preComputeVolume1(true, amt, 12345);
         assertEq(result, -amt);
     }
 
-    function test_preComputeVolume1_zeroForOne_largeNegative() public {
+    function test_preComputeVolume1_zeroForOne_largeNegative() public view {
         int256 amt = -1e18;
         int256 result = math.exposed_preComputeVolume1(true, amt, 12345);
         assertEq(result, amt);
@@ -83,35 +83,35 @@ contract NonToxicMathTest is Test {
 
     // --- zeroForOne = false ---
 
-    function test_preComputeVolume1_oneForZero_positiveAmount() public {
+    function test_preComputeVolume1_oneForZero_positiveAmount() public view {
         // 10 * 3^2 = 90
         int256 result = math.exposed_preComputeVolume1(false, 10, 3);
         assertEq(result, 90);
     }
 
-    function test_preComputeVolume1_oneForZero_negativeAmount() public {
+    function test_preComputeVolume1_oneForZero_negativeAmount() public view {
         // -10 * 3^2 = -90
         int256 result = math.exposed_preComputeVolume1(false, -10, 3);
         assertEq(result, -90);
     }
 
-    function test_preComputeVolume1_oneForZero_zeroAmount() public {
+    function test_preComputeVolume1_oneForZero_zeroAmount() public view {
         int256 result = math.exposed_preComputeVolume1(false, 0, 100);
         assertEq(result, 0);
     }
 
-    function test_preComputeVolume1_oneForZero_zeroSqrtPrice() public {
+    function test_preComputeVolume1_oneForZero_zeroSqrtPrice() public view {
         int256 result = math.exposed_preComputeVolume1(false, 1000, 0);
         assertEq(result, 0);
     }
 
-    function test_preComputeVolume1_oneForZero_unitSqrtPrice() public {
+    function test_preComputeVolume1_oneForZero_unitSqrtPrice() public view {
         // amount * 1^2 = amount
         int256 result = math.exposed_preComputeVolume1(false, 42, 1);
         assertEq(result, 42);
     }
 
-    function test_preComputeVolume1_oneForZero_largeValues() public {
+    function test_preComputeVolume1_oneForZero_largeValues() public view {
         // sqrtPrice = 30 (typical for ETH/USDC after dividing by Q96)
         // amount = 1e12
         // result = 1e12 * 30^2 = 1e12 * 900 = 9e14
@@ -119,7 +119,7 @@ contract NonToxicMathTest is Test {
         assertEq(result, 9e14);
     }
 
-    function test_preComputeVolume1_oneForZero_sqrtPriceSquared() public {
+    function test_preComputeVolume1_oneForZero_sqrtPriceSquared() public view {
         // Verify the squaring: amount=1, sqrtPrice=100 => 1 * 100^2 = 10000
         int256 result = math.exposed_preComputeVolume1(false, 1, 100);
         assertEq(result, 10000);
@@ -482,7 +482,7 @@ contract NonToxicMathTest is Test {
     //                          FUZZ TESTS
     // =========================================================================
 
-    function testFuzz_preComputeVolume1_zeroForOne_positive(int256 amount, uint256 sqrtPrice) public {
+    function testFuzz_preComputeVolume1_zeroForOne_positive(int256 amount, uint256 sqrtPrice) public view {
         amount = bound(amount, 1, type(int128).max);
         sqrtPrice = bound(sqrtPrice, 0, type(uint128).max);
 
@@ -490,7 +490,7 @@ contract NonToxicMathTest is Test {
         assertEq(result, -amount);
     }
 
-    function testFuzz_preComputeVolume1_zeroForOne_negative(int256 amount, uint256 sqrtPrice) public {
+    function testFuzz_preComputeVolume1_zeroForOne_negative(int256 amount, uint256 sqrtPrice) public view {
         amount = bound(amount, type(int128).min, -1);
         sqrtPrice = bound(sqrtPrice, 0, type(uint128).max);
 
@@ -498,7 +498,7 @@ contract NonToxicMathTest is Test {
         assertEq(result, amount);
     }
 
-    function testFuzz_preComputeVolume1_oneForZero(int256 amount, uint128 sqrtPriceRaw) public {
+    function testFuzz_preComputeVolume1_oneForZero(int256 amount, uint128 sqrtPriceRaw) public view {
         // Bound to avoid overflow: amount * sqrtPrice^2 must fit int256
         amount = bound(amount, -1e18, 1e18);
         uint256 sqrtPrice = bound(uint256(sqrtPriceRaw), 0, 1e9);
