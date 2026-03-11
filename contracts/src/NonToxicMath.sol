@@ -11,7 +11,7 @@ contract NonToxicMath {
         bool zeroForOne,
         int256 amountSpecified,
         uint256 sqrtPrice
-    ) internal returns (int256 volume1) {
+    ) internal pure returns (int256 volume1) {
         if (zeroForOne && amountSpecified > 0) return -amountSpecified;
         if (zeroForOne && amountSpecified < 0) return amountSpecified;
 
