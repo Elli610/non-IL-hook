@@ -7,11 +7,11 @@ uint256 constant SCALE = 1e18;
 uint256 constant Q96 = 0x1000000000000000000000000;
 
 contract NonToxicMath {
-    function preComputeVolume1(
-        bool zeroForOne,
-        int256 amountSpecified,
-        uint256 sqrtPrice
-    ) internal pure returns (int256 volume1) {
+    function preComputeVolume1(bool zeroForOne, int256 amountSpecified, uint256 sqrtPrice)
+        internal
+        pure
+        returns (int256 volume1)
+    {
         if (zeroForOne && amountSpecified > 0) return -amountSpecified;
         if (zeroForOne && amountSpecified < 0) return amountSpecified;
 
@@ -41,16 +41,14 @@ contract NonToxicMath {
         uint256 sqrtpriceHistoryScaled;
         // Swap  dans la tendance ?
         if (
-            (currentSqrtPriceScaled > initialSqrtpriceScaled_ && volume1 > 0) ||
-            (currentSqrtPriceScaled < initialSqrtpriceScaled_ && volume1 < 0)
+            (currentSqrtPriceScaled > initialSqrtpriceScaled_ && volume1 > 0)
+                || (currentSqrtPriceScaled < initialSqrtpriceScaled_ && volume1 < 0)
         ) {
-            sqrtpriceHistoryScaled = initialSqrtpriceScaled_ >
-                currentSqrtPriceScaled
+            sqrtpriceHistoryScaled = initialSqrtpriceScaled_ > currentSqrtPriceScaled
                 ? initialSqrtpriceScaled_ - currentSqrtPriceScaled
                 : currentSqrtPriceScaled - initialSqrtpriceScaled_;
         } else {
-            sqrtpriceHistoryScaled = extremumSqrtpriceScaled_ >
-                currentSqrtPriceScaled
+            sqrtpriceHistoryScaled = extremumSqrtpriceScaled_ > currentSqrtPriceScaled
                 ? extremumSqrtpriceScaled_ - currentSqrtPriceScaled
                 : currentSqrtPriceScaled - extremumSqrtpriceScaled_;
         }
@@ -58,9 +56,9 @@ contract NonToxicMath {
         uint256 volume1Signed = uint256(volume1 > 0 ? volume1 : -volume1);
 
         // todo: la c'est bizarre, j'ai l'impression que le scaling n'est pas homogene (vu que les sqrtPrice sont aussi scaled)
-        uint256 feePercentScaled = (alpha *
-            (((volume1Signed * SCALE * SCALE) / (2 * activeLiq)) +
-                (SCALE * sqrtpriceHistoryScaled))) / currentSqrtPriceScaled;
+        uint256 feePercentScaled =
+            (alpha * (((volume1Signed * SCALE * SCALE) / (2 * activeLiq)) + (SCALE * sqrtpriceHistoryScaled)))
+                / currentSqrtPriceScaled;
 
         return feePercentScaled;
     }

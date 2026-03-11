@@ -4,326 +4,474 @@ pragma solidity ^0.8.26;
 import {BaseHook} from "@openzeppelin/uniswap-hooks/src/base/BaseHook.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
-import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
-import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {BalanceDelta, BalanceDeltaLibrary} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {NonToxicMath, SCALE, Q96} from "./NonToxicMath.sol";
 import {IStateView} from "lib/v4-periphery/src/interfaces/IStateView.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
-import {Actions} from "lib/v4-periphery/src/libraries/Actions.sol";
-import {IPositionManager} from "lib/v4-periphery/src/interfaces/IPositionManager.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IERC20} from "forge-std/interfaces/IERC20.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
+import {ERC20} from "solmate/src/tokens/ERC20.sol";
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 
 uint160 constant HOOK_FLAGS = uint160(
-    Hooks.BEFORE_INITIALIZE_FLAG |
-        Hooks.BEFORE_SWAP_FLAG |
-        Hooks.AFTER_INITIALIZE_FLAG |
-        Hooks.AFTER_SWAP_FLAG
+    Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG
 );
 
 struct Position {
-    int24 tickUpper;
     int24 tickLower;
-    uint256 liquidity;
+    int24 tickUpper;
+    uint128 liquidity;
 }
 
-// todo: save poolKey to make sure we are always working with the same pool OR map poolIds to all state values
-contract NonToxicPool is BaseHook, NonToxicMath {
+contract NonToxicPool is BaseHook, NonToxicMath, ERC20, IUnlockCallback {
     using LPFeeLibrary for uint24;
     using PoolIdLibrary for PoolKey;
+    using BalanceDeltaLibrary for BalanceDelta;
 
-    uint24 public constant WANTED_DRAWBACK = 9_000; // 1.5 tick spacing
+    uint24 public constant WANTED_DRAWBACK = 9_000; // ~1.5 tick spacing
 
     IStateView public immutable stateView;
-    IPositionManager public immutable positionManager;
-
     IERC20 public immutable token0;
     IERC20 public immutable token1;
-
-    // Fee multiplier
     uint256 public immutable alpha;
+    int24 public immutable wideRangeMultiplier;
+    int24 public immutable narrowRangeMultiplier;
 
-    // Last sqrt price with a drawback > 1 tick
+    // Pool state
+    PoolKey internal storedPoolKey;
+    bool public poolInitialized;
+
+    // Price tracking
     uint256 public initialSqrtPriceScaled;
-    // Max or min sqrt price since the last drawback > 1 tick
     uint256 public extremumSqrtPriceScaled;
-    // todo: I guess we can get rid of it since this one matches the tick for extremumSqrtPriceScaled (so can be recomputed)
     int24 public extremumTick;
 
-    Position public position1;
-    Position public position2;
+    // Positions (wide = earning range, narrow = limit-order rebalancing range)
+    Position public widePosition;
+    Position public narrowPosition;
+
+    bytes32 internal constant WIDE_SALT = bytes32(uint256(1));
+    bytes32 internal constant NARROW_SALT = bytes32(uint256(2));
+
+    uint8 internal constant ACTION_DEPOSIT = 1;
+    uint8 internal constant ACTION_WITHDRAW = 2;
 
     error MustUseDynamicFee();
+    error PoolNotInitialized();
+    error ZeroDeposit();
+    error ZeroShares();
+    error InsufficientShares();
+    error OnlyPoolManager();
+
+    event Deposit(address indexed user, uint256 amount0, uint256 amount1, uint256 shares);
+    event Withdraw(address indexed user, uint256 shares, uint256 amount0, uint256 amount1);
+    event Rebalance(int24 wideLower, int24 wideUpper, int24 narrowLower, int24 narrowUpper);
 
     constructor(
-        IPositionManager _positionManager,
         IPoolManager _poolManager,
         IERC20 _token0,
         IERC20 _token1,
         IStateView _stateView,
-        uint256 _alpha
-    ) BaseHook(_poolManager) {
+        uint256 _alpha,
+        int24 _wideRangeMultiplier,
+        int24 _narrowRangeMultiplier
+    ) BaseHook(_poolManager) ERC20("NonToxic Vault", "ntVLT", 18) {
         alpha = _alpha;
         token0 = _token0;
         token1 = _token1;
         stateView = _stateView;
-        positionManager = _positionManager;
+        wideRangeMultiplier = _wideRangeMultiplier;
+        narrowRangeMultiplier = _narrowRangeMultiplier;
     }
 
-    function getHookPermissions()
-        public
-        pure
-        override
-        returns (Hooks.Permissions memory permissions)
-    {
-        return
-            Hooks.Permissions({
-                beforeInitialize: true,
-                afterInitialize: true,
-                beforeAddLiquidity: false,
-                afterAddLiquidity: false,
-                beforeRemoveLiquidity: false,
-                afterRemoveLiquidity: false,
-                beforeSwap: true,
-                afterSwap: true,
-                beforeDonate: false,
-                afterDonate: false,
-                beforeSwapReturnDelta: false,
-                afterSwapReturnDelta: false,
-                afterAddLiquidityReturnDelta: false,
-                afterRemoveLiquidityReturnDelta: false
-            });
+    // ===================== HOOK PERMISSIONS =====================
+
+    function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
+        return Hooks.Permissions({
+            beforeInitialize: true,
+            afterInitialize: true,
+            beforeAddLiquidity: false,
+            afterAddLiquidity: false,
+            beforeRemoveLiquidity: false,
+            afterRemoveLiquidity: false,
+            beforeSwap: true,
+            afterSwap: true,
+            beforeDonate: false,
+            afterDonate: false,
+            beforeSwapReturnDelta: false,
+            afterSwapReturnDelta: false,
+            afterAddLiquidityReturnDelta: false,
+            afterRemoveLiquidityReturnDelta: false
+        });
     }
 
-    function _beforeInitialize(
-        address,
-        PoolKey calldata key,
-        uint160
-    ) internal pure override returns (bytes4) {
-        // Check that the attached pool has dynamic fee
+    // ===================== HOOK CALLBACKS =====================
+
+    function _beforeInitialize(address, PoolKey calldata key, uint160) internal pure override returns (bytes4) {
         if (!key.fee.isDynamicFee()) revert MustUseDynamicFee();
         return this.beforeInitialize.selector;
     }
 
-    function _afterInitialize(
-        address,
-        PoolKey calldata,
-        uint160 sqrtPriceX96,
-        int24 tick
-    ) internal override returns (bytes4) {
-        // Save the current sqrtPrice and tick
+    function _afterInitialize(address, PoolKey calldata key, uint160 sqrtPriceX96, int24 tick)
+        internal
+        override
+        returns (bytes4)
+    {
         extremumTick = tick;
-
         uint256 sqrtPrice = (SCALE * uint256(sqrtPriceX96)) / Q96;
         initialSqrtPriceScaled = sqrtPrice;
         extremumSqrtPriceScaled = sqrtPrice;
 
-        return (BaseHook.afterInitialize.selector);
+        storedPoolKey = key;
+        poolInitialized = true;
+
+        return BaseHook.afterInitialize.selector;
     }
 
-    function _beforeSwap(
-        address,
-        PoolKey calldata key,
-        SwapParams calldata params,
-        bytes calldata
-    ) internal override returns (bytes4, BeforeSwapDelta, uint24) {
-        // int256 volume1,
-        // uint256 alpha,
-        // uint256 activeLiq,
-        // uint256 initialSqrtprice_,
-        // uint256 extremumSqrtprice_,
-        // uint256 currentSqrtPrice
-
-        // struct SwapParams {
-        //     /// Whether to swap token0 for token1 or vice versa
-        //     bool zeroForOne;
-        //     /// The desired input amount if negative (exactIn), or the desired output amount if positive (exactOut)
-        //     int256 amountSpecified;
-        //     /// The sqrt price at which, if reached, the swap will stop executing
-        //     uint160 sqrtPriceLimitX96;
-        // }
-
+    function _beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata)
+        internal
+        override
+        returns (bytes4, BeforeSwapDelta, uint24)
+    {
         PoolId poolId = key.toId();
-
-        (uint160 sqrtPriceX96, int24 currentTick, , ) = stateView.getSlot0(
-            poolId
-        );
-
+        (uint160 sqrtPriceX96,,,) = stateView.getSlot0(poolId);
         uint256 currentSqrtPriceScaled = (SCALE * uint256(sqrtPriceX96)) / Q96;
 
-        int256 volume1 = preComputeVolume1(
-            params.zeroForOne,
-            params.amountSpecified,
-            uint256(sqrtPriceX96) / Q96
-        );
-
         uint256 activeLiq = uint256(stateView.getLiquidity(poolId));
+        if (activeLiq == 0) {
+            return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+        }
+
+        int256 volume1 = preComputeVolume1(params.zeroForOne, params.amountSpecified, uint256(sqrtPriceX96) / Q96);
 
         uint256 newPoolFeePercentScaled = computeFees(
-            volume1,
-            alpha,
-            activeLiq,
-            initialSqrtPriceScaled,
-            extremumSqrtPriceScaled,
-            currentSqrtPriceScaled
+            volume1, alpha, activeLiq, initialSqrtPriceScaled, extremumSqrtPriceScaled, currentSqrtPriceScaled
         );
 
         uint256 newPoolFee = (newPoolFeePercentScaled * 1_000_000) / SCALE;
 
-        poolManager.updateDynamicLPFee(
-            key,
-            uint24(newPoolFee > 1_000_000 ? 1_000_000 : newPoolFee)
-        );
+        poolManager.updateDynamicLPFee(key, uint24(newPoolFee > 1_000_000 ? 1_000_000 : newPoolFee));
 
-        return (
-            BaseHook.beforeSwap.selector,
-            BeforeSwapDeltaLibrary.ZERO_DELTA,
-            0
-        );
+        return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    function _afterSwap(
-        address,
-        PoolKey calldata key,
-        SwapParams calldata,
-        BalanceDelta,
-        bytes calldata
-    ) internal override returns (bytes4, int128) {
-        // Identify the trend
+    function _afterSwap(address, PoolKey calldata key, SwapParams calldata, BalanceDelta, bytes calldata)
+        internal
+        override
+        returns (bytes4, int128)
+    {
         bool isUpTrend = extremumSqrtPriceScaled > initialSqrtPriceScaled;
-
-        (uint160 sqrtPriceX96, int24 currentTick, , ) = stateView.getSlot0(
-            key.toId()
-        );
+        (uint160 sqrtPriceX96, int24 currentTick,,) = stateView.getSlot0(key.toId());
         uint256 currentSqrtPriceScaled = (SCALE * uint256(sqrtPriceX96)) / Q96;
 
-        uint256 delta = uint256(
-            currentSqrtPriceScaled > extremumSqrtPriceScaled
-                ? currentSqrtPriceScaled - extremumSqrtPriceScaled
-                : extremumSqrtPriceScaled - currentSqrtPriceScaled
-        );
+        uint256 delta = currentSqrtPriceScaled > extremumSqrtPriceScaled
+            ? currentSqrtPriceScaled - extremumSqrtPriceScaled
+            : extremumSqrtPriceScaled - currentSqrtPriceScaled;
 
         if (delta / 2e6 > WANTED_DRAWBACK * currentSqrtPriceScaled) {
             initialSqrtPriceScaled = extremumSqrtPriceScaled;
             extremumSqrtPriceScaled = currentSqrtPriceScaled;
 
+            if (widePosition.liquidity > 0 || narrowPosition.liquidity > 0) {
+                _rebalance(key, currentTick, sqrtPriceX96);
+            }
+
             return (BaseHook.afterSwap.selector, 0);
         }
 
-        if (
-            (isUpTrend && currentTick > extremumTick) ||
-            (!isUpTrend && currentTick < extremumTick)
-        ) {
+        if ((isUpTrend && currentTick > extremumTick) || (!isUpTrend && currentTick < extremumTick)) {
             extremumTick = currentTick;
+            extremumSqrtPriceScaled = currentSqrtPriceScaled;
         }
 
         return (BaseHook.afterSwap.selector, 0);
     }
 
-    // Vault logic
+    // ===================== VAULT: DEPOSIT & WITHDRAW =====================
 
-    function rebalance(
-        address,
-        PoolKey calldata key,
-        SwapParams calldata,
-        BalanceDelta,
-        bytes calldata,
-        uint256 currentSqrtPriceScaled
-    ) internal {
-        // Let's do it the dummy way
+    function deposit(uint256 amount0, uint256 amount1) external {
+        if (!poolInitialized) revert PoolNotInitialized();
+        if (amount0 == 0 && amount1 == 0) revert ZeroDeposit();
 
-        // remove all positions
-        burnLiquidity(key, position1, 1, position1.liquidity, 0, 0);
-        burnLiquidity(key, position2, 2, position2.liquidity, 0, 0);
+        if (amount0 > 0) token0.transferFrom(msg.sender, address(this), amount0);
+        if (amount1 > 0) token1.transferFrom(msg.sender, address(this), amount1);
 
-        uint256 balance0 = token0.balanceOf(address(this));
-        uint256 balance1 = token1.balanceOf(address(this));
+        bytes memory result = poolManager.unlock(abi.encode(ACTION_DEPOSIT, amount0, amount1));
+        uint256 shares = abi.decode(result, (uint256));
+        if (shares == 0) revert ZeroShares();
 
-        // compute wallet repartition
-
-        // value of balance 1 expressed in token 0
-        uint256 balance1In0 = balance1 * currentSqrtPriceScaled ** 2;
-
-        uint256 ratioScaled = balance1 / balance0;
-
-        // Todo: Best thing to do would be doing some research and simulations to know if its better
-        //       to rebalance at each swap doesn't matter the volume, liq, etc or rebalance in precise circomstances
-        //       might also be useless to do and the diff is non-relevant
-
-        // For today: rebalance at each swap
-        // todo
+        _mint(msg.sender, shares);
+        emit Deposit(msg.sender, amount0, amount1, shares);
     }
 
-    function mintLiquidity(
-        PoolKey calldata poolKey,
-        Position memory position,
-        uint8 positionIndex,
-        uint256 liquidityDelta,
-        uint256 amount0Max,
-        uint256 amount1Max
-    ) internal {
-        // Prepare mint parameters
-        bytes memory actions = abi.encodePacked(
-            uint8(Actions.MINT_POSITION),
-            uint8(Actions.SETTLE_PAIR)
-        );
+    function withdraw(uint256 shares) external {
+        if (shares == 0 || shares > balanceOf[msg.sender]) revert InsufficientShares();
 
-        bytes[] memory params = new bytes[](2);
+        uint256 supply = totalSupply;
+        _burn(msg.sender, shares);
 
-        // MINT_POSITION parameters
-        params[0] = abi.encode(
-            poolKey,
-            position.tickLower,
-            position.tickUpper,
-            position.liquidity,
-            amount0Max,
-            amount1Max,
-            address(this), // recipient
-            bytes("") // hookData
-        );
+        bytes memory result = poolManager.unlock(abi.encode(ACTION_WITHDRAW, shares, supply));
+        (uint256 out0, uint256 out1) = abi.decode(result, (uint256, uint256));
 
-        // SETTLE_PAIR parameters
-        params[1] = abi.encode(
-            Currency.wrap(address(token0)),
-            Currency.wrap(address(token1))
-        );
+        if (out0 > 0) token0.transfer(msg.sender, out0);
+        if (out1 > 0) token1.transfer(msg.sender, out1);
 
-        // Add liquidity through PositionManager
-        positionManager.modifyLiquidities(
-            abi.encode(actions, params),
-            block.timestamp // deadline
-        );
-
-        if (positionIndex == 1) {
-            position1.liquidity += liquidityDelta;
-            return;
-        }
-        if (positionIndex == 2) {
-            position2.liquidity += liquidityDelta;
-            return;
-        }
-
-        revert("Invalid position index");
+        emit Withdraw(msg.sender, shares, out0, out1);
     }
 
-    function burnLiquidity(
-        PoolKey calldata poolKey,
-        Position memory position,
-        uint8 positionIndex,
-        uint256 liquidityDelta,
-        uint256 amount0Max, // ??
-        uint256 amount1Max // ??
-    ) internal {
-        revert("todo");
+    // ===================== UNLOCK CALLBACK =====================
 
-        if (positionIndex == 1) {
-            position1.liquidity -= liquidityDelta;
+    function unlockCallback(bytes calldata data) external override returns (bytes memory) {
+        if (msg.sender != address(poolManager)) revert OnlyPoolManager();
+
+        (uint8 action) = abi.decode(data[:32], (uint8));
+
+        if (action == ACTION_DEPOSIT) {
+            return _handleDeposit(data);
+        } else if (action == ACTION_WITHDRAW) {
+            return _handleWithdraw(data);
         }
-        if (positionIndex == 2) {
-            position2.liquidity -= liquidityDelta;
+
+        return "";
+    }
+
+    // ===================== INTERNAL: CALLBACK HANDLERS =====================
+
+    function _handleDeposit(bytes calldata data) internal returns (bytes memory) {
+        (, uint256 depositAmount0, uint256 depositAmount1) = abi.decode(data, (uint8, uint256, uint256));
+
+        // Remove all existing liquidity so we can compute accurate vault value
+        _removeAllLiquidity();
+
+        uint256 totalBal0 = token0.balanceOf(address(this));
+        uint256 totalBal1 = token1.balanceOf(address(this));
+
+        uint256 preBal0 = totalBal0 - depositAmount0;
+        uint256 preBal1 = totalBal1 - depositAmount1;
+
+        // Compute shares
+        uint256 shares;
+        uint256 supply = totalSupply;
+
+        if (supply == 0) {
+            shares = depositAmount0 + depositAmount1;
+        } else {
+            (uint160 sqrtPriceX96,,,) = stateView.getSlot0(storedPoolKey.toId());
+            uint256 preValue = _valueInToken1(preBal0, preBal1, sqrtPriceX96);
+            uint256 depositValue = _valueInToken1(depositAmount0, depositAmount1, sqrtPriceX96);
+            shares = (depositValue * supply) / preValue;
         }
+
+        // Re-provision all tokens as liquidity
+        _provisionLiquidity();
+
+        return abi.encode(shares);
+    }
+
+    function _handleWithdraw(bytes calldata data) internal returns (bytes memory) {
+        (, uint256 shares, uint256 supply) = abi.decode(data, (uint8, uint256, uint256));
+
+        // Remove all liquidity
+        _removeAllLiquidity();
+
+        // Compute proportional amounts
+        uint256 totalBal0 = token0.balanceOf(address(this));
+        uint256 totalBal1 = token1.balanceOf(address(this));
+
+        uint256 out0 = (totalBal0 * shares) / supply;
+        uint256 out1 = (totalBal1 * shares) / supply;
+
+        // Set aside withdrawal amounts (they'll be transferred after unlock returns)
+        // Re-provision the remaining tokens
+        // We need to track what to send. Store temporarily and re-provision the rest.
+        uint256 remaining0 = totalBal0 - out0;
+        uint256 remaining1 = totalBal1 - out1;
+
+        if (remaining0 > 0 || remaining1 > 0) {
+            _provisionLiquidityWithAmounts(remaining0, remaining1);
+        }
+
+        return abi.encode(out0, out1);
+    }
+
+    // ===================== INTERNAL: LIQUIDITY MANAGEMENT =====================
+
+    function _removeAllLiquidity() internal {
+        int256 netDelta0;
+        int256 netDelta1;
+
+        if (widePosition.liquidity > 0) {
+            (BalanceDelta callerDelta,) = poolManager.modifyLiquidity(
+                storedPoolKey,
+                ModifyLiquidityParams({
+                    tickLower: widePosition.tickLower,
+                    tickUpper: widePosition.tickUpper,
+                    liquidityDelta: -int256(uint256(widePosition.liquidity)),
+                    salt: WIDE_SALT
+                }),
+                ""
+            );
+            netDelta0 += callerDelta.amount0();
+            netDelta1 += callerDelta.amount1();
+            widePosition.liquidity = 0;
+        }
+
+        if (narrowPosition.liquidity > 0) {
+            (BalanceDelta callerDelta,) = poolManager.modifyLiquidity(
+                storedPoolKey,
+                ModifyLiquidityParams({
+                    tickLower: narrowPosition.tickLower,
+                    tickUpper: narrowPosition.tickUpper,
+                    liquidityDelta: -int256(uint256(narrowPosition.liquidity)),
+                    salt: NARROW_SALT
+                }),
+                ""
+            );
+            netDelta0 += callerDelta.amount0();
+            netDelta1 += callerDelta.amount1();
+            narrowPosition.liquidity = 0;
+        }
+
+        _settleDelta(storedPoolKey.currency0, netDelta0);
+        _settleDelta(storedPoolKey.currency1, netDelta1);
+    }
+
+    function _provisionLiquidity() internal {
+        _provisionLiquidityWithAmounts(token0.balanceOf(address(this)), token1.balanceOf(address(this)));
+    }
+
+    function _provisionLiquidityWithAmounts(uint256 bal0, uint256 bal1) internal {
+        if (bal0 == 0 && bal1 == 0) return;
+
+        (uint160 sqrtPriceX96, int24 currentTick,,) = stateView.getSlot0(storedPoolKey.toId());
+        int24 ts = storedPoolKey.tickSpacing;
+
+        // --- Wide position (80% of tokens) ---
+        int24 wideTickLower = _alignTick(currentTick - wideRangeMultiplier * ts, ts);
+        int24 wideTickUpper = _alignTick(currentTick + wideRangeMultiplier * ts, ts);
+        wideTickLower = wideTickLower < TickMath.minUsableTick(ts) ? TickMath.minUsableTick(ts) : wideTickLower;
+        wideTickUpper = wideTickUpper > TickMath.maxUsableTick(ts) ? TickMath.maxUsableTick(ts) : wideTickUpper;
+
+        uint256 wideUsed0;
+        uint256 wideUsed1;
+
+        if (wideTickLower < wideTickUpper) {
+            uint256 wide0 = (bal0 * 80) / 100;
+            uint256 wide1 = (bal1 * 80) / 100;
+            uint128 wideLiq = LiquidityAmounts.getLiquidityForAmounts(
+                sqrtPriceX96,
+                TickMath.getSqrtPriceAtTick(wideTickLower),
+                TickMath.getSqrtPriceAtTick(wideTickUpper),
+                wide0,
+                wide1
+            );
+
+            if (wideLiq > 0) {
+                _addPositionAndSettle(wideTickLower, wideTickUpper, wideLiq, WIDE_SALT);
+                widePosition = Position(wideTickLower, wideTickUpper, wideLiq);
+                wideUsed0 = wide0 > bal0 ? bal0 : wide0;
+                wideUsed1 = wide1 > bal1 ? bal1 : wide1;
+            }
+        }
+
+        // --- Narrow position (remaining tokens, limit order for rebalancing) ---
+        bool isUpTrend = extremumSqrtPriceScaled >= initialSqrtPriceScaled;
+        int24 narrowTickLower;
+        int24 narrowTickUpper;
+
+        if (isUpTrend) {
+            narrowTickLower = _alignTick(currentTick, ts) + ts;
+            narrowTickUpper = narrowTickLower + narrowRangeMultiplier * ts;
+        } else {
+            narrowTickUpper = _alignTick(currentTick, ts);
+            narrowTickLower = narrowTickUpper - narrowRangeMultiplier * ts;
+        }
+
+        narrowTickLower = narrowTickLower < TickMath.minUsableTick(ts) ? TickMath.minUsableTick(ts) : narrowTickLower;
+        narrowTickUpper = narrowTickUpper > TickMath.maxUsableTick(ts) ? TickMath.maxUsableTick(ts) : narrowTickUpper;
+
+        if (narrowTickLower < narrowTickUpper) {
+            uint256 rem0 = bal0 > wideUsed0 ? bal0 - wideUsed0 : 0;
+            uint256 rem1 = bal1 > wideUsed1 ? bal1 - wideUsed1 : 0;
+
+            if (rem0 > 0 || rem1 > 0) {
+                uint128 narrowLiq = LiquidityAmounts.getLiquidityForAmounts(
+                    sqrtPriceX96,
+                    TickMath.getSqrtPriceAtTick(narrowTickLower),
+                    TickMath.getSqrtPriceAtTick(narrowTickUpper),
+                    rem0,
+                    rem1
+                );
+
+                if (narrowLiq > 0) {
+                    _addPositionAndSettle(narrowTickLower, narrowTickUpper, narrowLiq, NARROW_SALT);
+                    narrowPosition = Position(narrowTickLower, narrowTickUpper, narrowLiq);
+                }
+            }
+        }
+    }
+
+    function _addPositionAndSettle(int24 tickLower, int24 tickUpper, uint128 liquidity, bytes32 salt) internal {
+        (BalanceDelta callerDelta,) = poolManager.modifyLiquidity(
+            storedPoolKey,
+            ModifyLiquidityParams({
+                tickLower: tickLower, tickUpper: tickUpper, liquidityDelta: int256(uint256(liquidity)), salt: salt
+            }),
+            ""
+        );
+
+        _settleDelta(storedPoolKey.currency0, callerDelta.amount0());
+        _settleDelta(storedPoolKey.currency1, callerDelta.amount1());
+    }
+
+    function _rebalance(PoolKey calldata key, int24 currentTick, uint160 sqrtPriceX96) internal {
+        _removeAllLiquidity();
+        _provisionLiquidity();
+
+        emit Rebalance(
+            widePosition.tickLower, widePosition.tickUpper, narrowPosition.tickLower, narrowPosition.tickUpper
+        );
+    }
+
+    // ===================== INTERNAL: SETTLEMENT =====================
+
+    function _settleDelta(Currency currency, int256 delta) internal {
+        if (delta < 0) {
+            // Hook owes tokens to pool (adding liquidity)
+            uint256 amount = uint256(-delta);
+            poolManager.sync(currency);
+            IERC20(Currency.unwrap(currency)).transfer(address(poolManager), amount);
+            poolManager.settle();
+        } else if (delta > 0) {
+            // Pool owes tokens to hook (removing liquidity)
+            poolManager.take(currency, address(this), uint256(delta));
+        }
+    }
+
+    // ===================== INTERNAL: HELPERS =====================
+
+    function _alignTick(int24 tick, int24 tickSpacing) internal pure returns (int24) {
+        int24 compressed = tick / tickSpacing;
+        if (tick < 0 && tick % tickSpacing != 0) compressed--;
+        return compressed * tickSpacing;
+    }
+
+    function _valueInToken1(uint256 amt0, uint256 amt1, uint160 sqrtPriceX96) internal pure returns (uint256) {
+        // price_token1_per_token0 = (sqrtPriceX96 / 2^96)^2
+        // value = amt0 * price + amt1
+        // Split multiplication to avoid overflow
+        uint256 value0 = (uint256(sqrtPriceX96) * amt0) / Q96;
+        value0 = (value0 * uint256(sqrtPriceX96)) / Q96;
+        return value0 + amt1;
+    }
+
+    function getStoredPoolKey() external view returns (PoolKey memory) {
+        return storedPoolKey;
     }
 }

@@ -24,10 +24,7 @@ import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 contract Create2Factory {
     event Deployed(address addr, bytes32 salt);
 
-    function deploy(
-        bytes memory bytecode,
-        bytes32 salt
-    ) external returns (address addr) {
+    function deploy(bytes memory bytecode, bytes32 salt) external returns (address addr) {
         assembly {
             addr := create2(0, add(bytecode, 0x20), mload(bytecode), salt)
             if iszero(extcodesize(addr)) {
@@ -37,25 +34,8 @@ contract Create2Factory {
         emit Deployed(addr, salt);
     }
 
-    function computeAddress(
-        bytes32 salt,
-        bytes32 bytecodeHash
-    ) external view returns (address) {
-        return
-            address(
-                uint160(
-                    uint256(
-                        keccak256(
-                            abi.encodePacked(
-                                bytes1(0xff),
-                                address(this),
-                                salt,
-                                bytecodeHash
-                            )
-                        )
-                    )
-                )
-            );
+    function computeAddress(bytes32 salt, bytes32 bytecodeHash) external view returns (address) {
+        return address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, bytecodeHash)))));
     }
 }
 
@@ -91,13 +71,9 @@ contract DeployNonToxicPool is Script {
 
     function logHeader(string memory title) internal pure {
         console.log("");
-        console.log(
-            "======================================================================="
-        );
+        console.log("=======================================================================");
         console.log(string.concat("  ", title));
-        console.log(
-            "======================================================================="
-        );
+        console.log("=======================================================================");
     }
 
     function logSection(string memory title) internal pure {
@@ -123,9 +99,7 @@ contract DeployNonToxicPool is Script {
     }
 
     function logInfo(string memory label, int24 value) internal pure {
-        console.log(
-            string.concat("  * ", label, ": ", vm.toString(int256(value)))
-        );
+        console.log(string.concat("  * ", label, ": ", vm.toString(int256(value))));
     }
 
     function logBytes32(string memory label, bytes32 value) internal pure {
@@ -133,22 +107,8 @@ contract DeployNonToxicPool is Script {
         console.log(string.concat("    0x", vm.toString(value)));
     }
 
-    function logProgress(
-        string memory message,
-        uint256 current,
-        uint256 total
-    ) internal pure {
-        console.log(
-            string.concat(
-                "[...] ",
-                message,
-                " (",
-                vm.toString(current),
-                "/",
-                vm.toString(total),
-                ")"
-            )
-        );
+    function logProgress(string memory message, uint256 current, uint256 total) internal pure {
+        console.log(string.concat("[...] ", message, " (", vm.toString(current), "/", vm.toString(total), ")"));
     }
 
     function logWarning(string memory message) internal pure {
@@ -156,9 +116,7 @@ contract DeployNonToxicPool is Script {
     }
 
     function logDivider() internal pure {
-        console.log(
-            "-----------------------------------------------------------------------"
-        );
+        console.log("-----------------------------------------------------------------------");
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -193,9 +151,7 @@ contract DeployNonToxicPool is Script {
             address(0x429ba70129df741B2Ca2a85BC3A2a3328e5c09b4) // Sepolia PositionManager
         );
 
-        stateView = IStateView(
-            address(0xE1Dd9c3fA50EDB962E442f60DfBc432e24537E4C)
-        );
+        stateView = IStateView(address(0xE1Dd9c3fA50EDB962E442f60DfBc432e24537E4C));
 
         permit2 = IPermit2(address(0x000000000022D473030F116dDEE9F6B43aC78BA3));
 
@@ -233,15 +189,7 @@ contract DeployNonToxicPool is Script {
         // Get the bytecode for the hook
         logSection("Preparing Hook Deployment");
         bytes memory hookBytecode = abi.encodePacked(
-            type(NonToxicPool).creationCode,
-            abi.encode(
-                positionManager,
-                poolManager,
-                token0,
-                token1,
-                stateView,
-                ALPHA
-            )
+            type(NonToxicPool).creationCode, abi.encode(positionManager, poolManager, token0, token1, stateView, ALPHA)
         );
 
         bytes32 bytecodeHash = keccak256(hookBytecode);
@@ -272,10 +220,7 @@ contract DeployNonToxicPool is Script {
         logInfo("Expected Flags", HOOK_FLAGS);
         logInfo("Actual Flags", actualFlags);
 
-        require(
-            actualFlags == HOOK_FLAGS,
-            "Hook address does not have required flags"
-        );
+        require(actualFlags == HOOK_FLAGS, "Hook address does not have required flags");
         logSuccess("Hook flags verified successfully");
 
         // Set up dynamic fee (0x800000 is the dynamic fee flag)
@@ -382,10 +327,8 @@ contract DeployNonToxicPool is Script {
 
         // Align ticks to tickSpacing
         int24 tickSpacing = poolKey.tickSpacing;
-        int24 tickLower = ((currentTick - TICK_RANGE) / tickSpacing) *
-            tickSpacing;
-        int24 tickUpper = ((currentTick + TICK_RANGE) / tickSpacing) *
-            tickSpacing;
+        int24 tickLower = ((currentTick - TICK_RANGE) / tickSpacing) * tickSpacing;
+        int24 tickUpper = ((currentTick + TICK_RANGE) / tickSpacing) * tickSpacing;
 
         logSection("Position Configuration");
         logInfo("Current Tick (approx)", currentTick);
@@ -393,10 +336,7 @@ contract DeployNonToxicPool is Script {
         logInfo("Tick Upper", tickUpper);
 
         // Prepare mint parameters
-        bytes memory actions = abi.encodePacked(
-            uint8(Actions.MINT_POSITION),
-            uint8(Actions.SETTLE_PAIR)
-        );
+        bytes memory actions = abi.encodePacked(uint8(Actions.MINT_POSITION), uint8(Actions.SETTLE_PAIR));
 
         bytes[] memory params = new bytes[](2);
 
@@ -413,10 +353,7 @@ contract DeployNonToxicPool is Script {
         );
 
         // SETTLE_PAIR parameters
-        params[1] = abi.encode(
-            Currency.wrap(address(token0)),
-            Currency.wrap(address(token1))
-        );
+        params[1] = abi.encode(Currency.wrap(address(token0)), Currency.wrap(address(token1)));
 
         logSection("Executing Liquidity Addition");
         console.log("[...] Calling modifyLiquidities...");
@@ -460,17 +397,11 @@ contract DeployNonToxicPool is Script {
         });
 
         // Prepare test settings
-        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest
-            .TestSettings({takeClaims: false, settleUsingBurn: false});
+        PoolSwapTest.TestSettings memory testSettings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
 
         logSection("Executing Swap");
-        console.log(
-            string.concat(
-                "[...] Swapping ",
-                vm.toString(amount),
-                " token0 for token1..."
-            )
-        );
+        console.log(string.concat("[...] Swapping ", vm.toString(amount), " token0 for token1..."));
 
         // Execute swap
         BalanceDelta delta = swapRouter.swap(
@@ -489,26 +420,12 @@ contract DeployNonToxicPool is Script {
         logInfo("Token1", token1After);
 
         logSection("Balance Deltas");
-        console.log(
-            string.concat("  * Amount0: ", vm.toString(delta.amount0()))
-        );
-        console.log(
-            string.concat("  * Amount1: ", vm.toString(delta.amount1()))
-        );
+        console.log(string.concat("  * Amount0: ", vm.toString(delta.amount0())));
+        console.log(string.concat("  * Amount1: ", vm.toString(delta.amount1())));
 
         logSection("Net Changes");
-        console.log(
-            string.concat(
-                "  * Token0 Change: ",
-                vm.toString(int256(token0After) - int256(token0Before))
-            )
-        );
-        console.log(
-            string.concat(
-                "  * Token1 Change: ",
-                vm.toString(int256(token1After) - int256(token1Before))
-            )
-        );
+        console.log(string.concat("  * Token0 Change: ", vm.toString(int256(token0After) - int256(token0Before))));
+        console.log(string.concat("  * Token1 Change: ", vm.toString(int256(token1After) - int256(token1Before))));
 
         logDivider();
     }
@@ -517,34 +434,20 @@ contract DeployNonToxicPool is Script {
     /// @param factoryAddr The address of the CREATE2 factory
     /// @param bytecode The creation bytecode
     /// @return salt The salt that produces the correct address
-    function mineSalt(
-        address factoryAddr,
-        bytes memory bytecode
-    ) internal view returns (bytes32) {
+    function mineSalt(address factoryAddr, bytes memory bytecode) internal view returns (bytes32) {
         bytes32 bytecodeHash = keccak256(bytecode);
 
         // Mine for a salt
         for (uint256 i = 0; i < 100_000_000; i++) {
             bytes32 salt = bytes32(i);
 
-            address predictedAddress = computeCreate2Address(
-                factoryAddr,
-                salt,
-                bytecodeHash
-            );
+            address predictedAddress = computeCreate2Address(factoryAddr, salt, bytecodeHash);
 
-            uint160 addressFlags = uint160(predictedAddress) &
-                Hooks.ALL_HOOK_MASK;
+            uint160 addressFlags = uint160(predictedAddress) & Hooks.ALL_HOOK_MASK;
 
             // Check if this address has the required hook flags
             if (addressFlags == HOOK_FLAGS) {
-                console.log(
-                    string.concat(
-                        "  [OK] Found after ",
-                        vm.toString(i),
-                        " iterations"
-                    )
-                );
+                console.log(string.concat("  [OK] Found after ", vm.toString(i), " iterations"));
                 logInfo("Predicted Address", predictedAddress);
                 return salt;
             }
@@ -563,34 +466,15 @@ contract DeployNonToxicPool is Script {
     /// @param salt The salt
     /// @param initCodeHash The init code hash
     /// @return The predicted address
-    function computeCreate2Address(
-        address deployer,
-        bytes32 salt,
-        bytes32 initCodeHash
-    ) internal pure returns (address) {
-        return
-            address(
-                uint160(
-                    uint256(
-                        keccak256(
-                            abi.encodePacked(
-                                bytes1(0xff),
-                                deployer,
-                                salt,
-                                initCodeHash
-                            )
-                        )
-                    )
-                )
-            );
+    function computeCreate2Address(address deployer, bytes32 salt, bytes32 initCodeHash)
+        internal
+        pure
+        returns (address)
+    {
+        return address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), deployer, salt, initCodeHash)))));
     }
 }
 
 interface IPermit2 {
-    function approve(
-        address token,
-        address spender,
-        uint160 amount,
-        uint48 expiration
-    ) external;
+    function approve(address token, address spender, uint160 amount, uint48 expiration) external;
 }
