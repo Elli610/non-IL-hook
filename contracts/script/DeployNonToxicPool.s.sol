@@ -56,6 +56,8 @@ contract DeployNonToxicPool is Script {
 
     // Deployment parameters
     uint256 public constant ALPHA = 1; // Fee multiplier
+    int24 public constant WIDE_RANGE_MULTIPLIER = 10;
+    int24 public constant NARROW_RANGE_MULTIPLIER = 2;
     uint160 public constant INITIAL_SQRT_PRICE = 79228162514264337593543950336; // Roughly 1:1 price
 
     // Liquidity parameters
@@ -189,7 +191,8 @@ contract DeployNonToxicPool is Script {
         // Get the bytecode for the hook
         logSection("Preparing Hook Deployment");
         bytes memory hookBytecode = abi.encodePacked(
-            type(NonToxicPool).creationCode, abi.encode(positionManager, poolManager, token0, token1, stateView, ALPHA)
+            type(NonToxicPool).creationCode,
+            abi.encode(poolManager, token0, token1, stateView, ALPHA, WIDE_RANGE_MULTIPLIER, NARROW_RANGE_MULTIPLIER)
         );
 
         bytes32 bytecodeHash = keccak256(hookBytecode);
